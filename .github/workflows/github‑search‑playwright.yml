@@ -1,45 +1,44 @@
-name: GitHub recovery
+name: GitHub Playwright Search + Spam/Slop Report
 
-# You can trigger manually or by schedule (min 5 minutes)
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/5 * * * *" # ~every 5 minutes (shortest allowed)
+    - cron: "*/5 * * * *"  # run every ~5 minutes
 
 permissions:
   contents: read
   issues: write
 
 jobs:
-  scraper_and_report:
+  scrape_and_report:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout repo
+    - name: Checkout
       uses: actions/checkout@v4
 
-    - name: Setup Node.js
+    - name: Set up Node.js
       uses: actions/setup-node@v3
       with:
-        node-version: "18"
+        node-version: '18'
 
     - name: Install Playwright
       run: |
         npm init -y
         npm install playwright
 
-    - name: Run Playwright GitHub Search and Detect Spam
-      id: run_scrape
+    - name: Run Playwright search
+      id: run_scraper
       run: |
         cat << 'EOF' > search.js
-        import { chromium } from "playwright";
-        import fs from "fs";
+        const { chromium } = require("playwright");
+        const fs = require("fs");
 
         (async () => {
           const searchTerms = [
             "web scraping",
             "automation tools",
-            "open source security",
+            "open source projects",
             "javascript",
             "python",
             "playwright"
@@ -49,7 +48,7 @@ jobs:
           const page = await browser.newPage();
           const allResults = [];
 
-          for (const term of searchTerms) {
+          for (let term of searchTerms) {
             const url = "https://github.com/search?q=" + encodeURIComponent(term);
             console.log("Searching:", term);
             await page.goto(url, { waitUntil: "domcontentloaded" });
@@ -59,28 +58,27 @@ jobs:
               return;
             });
 
-            const repos = await page.$$eval("ul.repo-list li", (nodes) => {
+            const results = await page.$$eval("ul.repo-list li", nodes => {
               return nodes.map(node => {
                 const titleEl = node.querySelector("a.v-align-middle");
                 const descEl = node.querySelector("p.mb-1");
                 const starsEl = node.querySelector("a[href*='/stargazers']");
                 const descText = descEl ? descEl.innerText.trim() : "";
-                // Quick spam/slop signifiers
-                const isSpam = /spam|test|dummy|illegal/i.test(descText);
+                const spam = /spam|test|dummy|illegal/i.test(descText);
 
                 return {
-                  term: term,
-                  name: titleEl ? titleEl.innerText.trim() : "",
-                  url: titleEl ? titleEl.href : "",
-                  desc: descText,
-                  stars: starsEl ? starsEl.innerText.trim() : "",
-                  spam: isSpam
+                  searchTerm: term,
+                  name: titleEl?.innerText.trim() || "",
+                  url: titleEl?.href || "",
+                  description: descText,
+                  stars: starsEl?.innerText.trim() || "",
+                  flaggedSpam: spam
                 };
               });
             });
 
-            allResults.push(...repos);
-            await page.waitForTimeout(2000);
+            allResults.push(...results);
+            await page.waitForTimeout(1500);
           }
 
           await browser.close();
@@ -89,64 +87,55 @@ jobs:
         EOF
 
         node search.js
-        echo "::set-output name=data_file::github_search_results.json"
 
-    - name: Create summary report
+    - name: Create monthly summary report
       id: create_report
       run: |
         node - << 'EOF'
         const fs = require("fs");
         const results = JSON.parse(fs.readFileSync("github_search_results.json"));
 
-        const spamItems = results.filter(r => r.spam);
-        const total = results.length;
-        const spamCount = spamItems.length;
-
-        const report = `
-        # GitHub Search Summary
-
-        **Total results scanned:** ${total}
-        **Spam/slop flagged:** ${spamCount}
-
-        ## Spam/Slop Repo List
-        ${spamItems.map(i => `- [${i.name}](${i.url}) — ${i.desc}`).join("\n")}
-
-        Generated: ${new Date().toISOString()}
-        `;
-        fs.writeFileSync("monthly_report.md", report);
-        console.log(report);
+        let reportText = "# Monthly GitHub Search Summary\n\n";
+        const spamItems = results.filter(r => r.flaggedSpam);
+        reportText += `Total repos scanned: ${results.length}\n`;
+        reportText += `Flagged spam/slop count: ${spamItems.length}\n\n`;
+        reportText += "## Flagged Spam/Slop Repositories\n";
+        spamItems.forEach(i => {
+          reportText += `- [${i.name}](${i.url}) — ${i.description}\n`;
+        });
+        reportText += `\nGenerated: ${new Date().toISOString()}`;
+        fs.writeFileSync("monthly_report.md", reportText);
         EOF
 
-    - name: Upload reports as artifacts
+    - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: github-search-results
+        name: github-search-reports
         path: |
           github_search_results.json
           monthly_report.md
 
-    - name: Post issues for spam/slop findings
+    - name: Report flagged spam/slop as GitHub Issue
       uses: actions/github-script@v6
       with:
         script: |
           const fs = require("fs");
-          const data = JSON.parse(fs.readFileSync("github_search_results.json", 'utf8'));
-          const spamItems = data.filter(x => x.spam);
-          if (spamItems.length === 0) {
-            console.log("No spam/slop items detected.");
+          const data = JSON.parse(fs.readFileSync("github_search_results.json", "utf8"));
+          const spamList = data.filter(x => x.flaggedSpam);
+          if (spamList.length === 0) {
+            console.log("No spam/slop found");
             return;
           }
 
-          const title = `Automated Spam/Slop Report: ${spamItems.length} items`;
-          let body = "We detected potential spam/slop in the latest GitHub search run:\n\n";
-          for (const itm of spamItems) {
-            body += `- [${itm.name}](${itm.url}) — ${itm.desc}\n`;
-          }
-          body += "\n**This report was generated automatically.**";
+          let body = "Automated spam/slop report:\n\n";
+          spamList.forEach(item => {
+            body += `- [${item.name}](${item.url}) — ${item.description}\n`;
+          });
+          body += "\n*This issue was created automatically.*";
 
-          github.rest.issues.create({
+          await github.rest.issues.create({
             owner: context.repo.owner,
             repo: context.repo.repo,
-            title,
+            title: `Spam/Slop Report — ${spamList.length} Findings`,
             body
           });
