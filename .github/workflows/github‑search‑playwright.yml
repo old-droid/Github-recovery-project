@@ -1,0 +1,91 @@
+name: GitHub recovery
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 1 * * *" # daily at 01:00 UTC
+
+jobs:
+  scrape:
+    name: Playwright Search Scraper
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v3
+      with:
+        node-version: '18'
+
+    - name: Install Playwright and Dependencies
+      run: |
+        npm init -y
+        npm install playwright
+
+    - name: Run Playwright Search Script
+      run: |
+        cat << 'EOF' > search.js
+        import { chromium } from 'playwright';
+        import fs from 'fs';
+
+        (async () => {
+          const searchTerms = [
+            "machine learning",
+            "web scraping",
+            "playwright automation",
+            "open source tools",
+            "javascript frameworks"
+          ];
+
+          const browser = await chromium.launch();
+          const page = await browser.newPage();
+          const allResults = [];
+
+          for (const term of searchTerms) {
+            const query = encodeURIComponent(term);
+            const url = `https://github.com/search?q=${query}`;
+            console.log("Searching:", term);
+
+            await page.goto(url, { waitUntil: 'domcontentloaded' });
+
+            // Wait for results list
+            await page.waitForSelector('ul.repo-list li', { timeout: 5000 }).catch(() => {
+              console.log("No results for", term);
+              return;
+            });
+
+            const results = await page.$$eval('ul.repo-list li', (items) =>
+              items.map(item => {
+                const titleElem = item.querySelector('a.v-align-middle');
+                const descElem = item.querySelector('p.mb-1');
+                const starsElem = item.querySelector('a[href*="/stargazers"]');
+                return {
+                  name: titleElem?.innerText.trim() || "",
+                  url: titleElem?.href || "",
+                  description: descElem?.innerText.trim() || "",
+                  stars: starsElem?.innerText.trim() || ""
+                };
+              })
+            );
+
+            results.forEach(r => r.searchTerm = term);
+            allResults.push(...results);
+
+            await page.waitForTimeout(1500); // pacing
+          }
+
+          await browser.close();
+          fs.writeFileSync('github_search_results.json', JSON.stringify(allResults, null, 2));
+          console.log("Saved results:", allResults.length);
+        })();
+        EOF
+
+        node search.js
+
+    - name: Upload Results
+      uses: actions/upload-artifact@v3
+      with:
+        name: github-search-playwright
+        path: github_search_results.json
