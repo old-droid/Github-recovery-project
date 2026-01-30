@@ -1,42 +1,48 @@
 name: GitHub recovery
 
+# You can trigger manually or by schedule (min 5 minutes)
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 1 * * *" # daily at 01:00 UTC
+    - cron: "*/5 * * * *" # ~every 5 minutes (shortest allowed)
+
+permissions:
+  contents: read
+  issues: write
 
 jobs:
-  scrape:
-    name: Playwright Search Scraper
+  scraper_and_report:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout
+    - name: Checkout repo
       uses: actions/checkout@v4
 
     - name: Setup Node.js
       uses: actions/setup-node@v3
       with:
-        node-version: '18'
+        node-version: "18"
 
-    - name: Install Playwright and Dependencies
+    - name: Install Playwright
       run: |
         npm init -y
         npm install playwright
 
-    - name: Run Playwright Search Script
+    - name: Run Playwright GitHub Search and Detect Spam
+      id: run_scrape
       run: |
         cat << 'EOF' > search.js
-        import { chromium } from 'playwright';
-        import fs from 'fs';
+        import { chromium } from "playwright";
+        import fs from "fs";
 
         (async () => {
           const searchTerms = [
-            "machine learning",
             "web scraping",
-            "playwright automation",
-            "open source tools",
-            "javascript frameworks"
+            "automation tools",
+            "open source security",
+            "javascript",
+            "python",
+            "playwright"
           ];
 
           const browser = await chromium.launch();
@@ -44,48 +50,103 @@ jobs:
           const allResults = [];
 
           for (const term of searchTerms) {
-            const query = encodeURIComponent(term);
-            const url = `https://github.com/search?q=${query}`;
+            const url = "https://github.com/search?q=" + encodeURIComponent(term);
             console.log("Searching:", term);
+            await page.goto(url, { waitUntil: "domcontentloaded" });
 
-            await page.goto(url, { waitUntil: 'domcontentloaded' });
-
-            // Wait for results list
-            await page.waitForSelector('ul.repo-list li', { timeout: 5000 }).catch(() => {
+            await page.waitForSelector("ul.repo-list li", { timeout: 5000 }).catch(() => {
               console.log("No results for", term);
               return;
             });
 
-            const results = await page.$$eval('ul.repo-list li', (items) =>
-              items.map(item => {
-                const titleElem = item.querySelector('a.v-align-middle');
-                const descElem = item.querySelector('p.mb-1');
-                const starsElem = item.querySelector('a[href*="/stargazers"]');
+            const repos = await page.$$eval("ul.repo-list li", (nodes) => {
+              return nodes.map(node => {
+                const titleEl = node.querySelector("a.v-align-middle");
+                const descEl = node.querySelector("p.mb-1");
+                const starsEl = node.querySelector("a[href*='/stargazers']");
+                const descText = descEl ? descEl.innerText.trim() : "";
+                // Quick spam/slop signifiers
+                const isSpam = /spam|test|dummy|illegal/i.test(descText);
+
                 return {
-                  name: titleElem?.innerText.trim() || "",
-                  url: titleElem?.href || "",
-                  description: descElem?.innerText.trim() || "",
-                  stars: starsElem?.innerText.trim() || ""
+                  term: term,
+                  name: titleEl ? titleEl.innerText.trim() : "",
+                  url: titleEl ? titleEl.href : "",
+                  desc: descText,
+                  stars: starsEl ? starsEl.innerText.trim() : "",
+                  spam: isSpam
                 };
-              })
-            );
+              });
+            });
 
-            results.forEach(r => r.searchTerm = term);
-            allResults.push(...results);
-
-            await page.waitForTimeout(1500); // pacing
+            allResults.push(...repos);
+            await page.waitForTimeout(2000);
           }
 
           await browser.close();
-          fs.writeFileSync('github_search_results.json', JSON.stringify(allResults, null, 2));
-          console.log("Saved results:", allResults.length);
+          fs.writeFileSync("github_search_results.json", JSON.stringify(allResults, null, 2));
         })();
         EOF
 
         node search.js
+        echo "::set-output name=data_file::github_search_results.json"
 
-    - name: Upload Results
-      uses: actions/upload-artifact@v3
+    - name: Create summary report
+      id: create_report
+      run: |
+        node - << 'EOF'
+        const fs = require("fs");
+        const results = JSON.parse(fs.readFileSync("github_search_results.json"));
+
+        const spamItems = results.filter(r => r.spam);
+        const total = results.length;
+        const spamCount = spamItems.length;
+
+        const report = `
+        # GitHub Search Summary
+
+        **Total results scanned:** ${total}
+        **Spam/slop flagged:** ${spamCount}
+
+        ## Spam/Slop Repo List
+        ${spamItems.map(i => `- [${i.name}](${i.url}) — ${i.desc}`).join("\n")}
+
+        Generated: ${new Date().toISOString()}
+        `;
+        fs.writeFileSync("monthly_report.md", report);
+        console.log(report);
+        EOF
+
+    - name: Upload reports as artifacts
+      uses: actions/upload-artifact@v4
       with:
-        name: github-search-playwright
-        path: github_search_results.json
+        name: github-search-results
+        path: |
+          github_search_results.json
+          monthly_report.md
+
+    - name: Post issues for spam/slop findings
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const fs = require("fs");
+          const data = JSON.parse(fs.readFileSync("github_search_results.json", 'utf8'));
+          const spamItems = data.filter(x => x.spam);
+          if (spamItems.length === 0) {
+            console.log("No spam/slop items detected.");
+            return;
+          }
+
+          const title = `Automated Spam/Slop Report: ${spamItems.length} items`;
+          let body = "We detected potential spam/slop in the latest GitHub search run:\n\n";
+          for (const itm of spamItems) {
+            body += `- [${itm.name}](${itm.url}) — ${itm.desc}\n`;
+          }
+          body += "\n**This report was generated automatically.**";
+
+          github.rest.issues.create({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            title,
+            body
+          });
